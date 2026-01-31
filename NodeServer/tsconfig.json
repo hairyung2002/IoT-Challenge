@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "es2020",             /* 최신 JS 기능 사용 */
+    "module": "commonjs",           /* Node.js는 기본적으로 CommonJS */
+    "outDir": "./dist",             /* 빌드 결과물 경로 */
+    "rootDir": "./src",             /* 소스 코드 경로 */
+    "strict": true,                 /* 타입 엄격하게 검사 (안전성 Up) */
+    "esModuleInterop": true,        /* CommonJS 모듈 호환성 */
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules"]
+}
