@@ -7,18 +7,26 @@ import {
   levelLabel,
   levelColor,
   levelTextColor,
+  startRandomSim,
+  stopRandomSim,
   type StatusPayload,
 } from './api'
 
 function App() {
   const [status, setStatus] = useState<StatusPayload | null>(null)
   const [connection, setConnection] = useState<'connecting' | 'open' | 'error'>('connecting')
-  const [vibHistory, setVibHistory] = useState<number[]>([])
+  const [tempHistory, setTempHistory] = useState<number[]>([])
   const [sndHistory, setSndHistory] = useState<number[]>([])
   const [lastPollTime, setLastPollTime] = useState<string>('--:--:--')
 
   useEffect(() => {
     let mounted = true
+
+    // 개발 편의: 환경변수로 자동 시뮬레이터 실행 (VITE_AUTO_SIM=true)
+    const autoSim = import.meta.env.VITE_AUTO_SIM === 'true'
+    if (autoSim) {
+      startRandomSim(5000).catch((err) => console.warn('auto sim start failed', err))
+    }
 
     // 폴링 방식으로 1초마다 상태 갱신
     const unsubscribe = subscribeStatus((data) => {
@@ -29,7 +37,7 @@ function App() {
       const now = new Date()
       setLastPollTime(now.toLocaleTimeString('ko-KR', { hour12: false }))
       if (data.data) {
-        setVibHistory((prev) => [...prev.slice(-29), data.data!.vib])
+        setTempHistory((prev) => [...prev.slice(-29), data.data!.temp])
         const sndNum = parseFloat(data.data!.snd) || 0
         setSndHistory((prev) => [...prev.slice(-29), sndNum])
       }
@@ -41,17 +49,27 @@ function App() {
     }
   }, [])
 
-  const riskScore = useMemo(() => Math.round(computeRiskScore(status?.data ?? null, status?.level ?? 'SAFE')), [status])
-  const node1Score = useMemo(() => Math.round(computeRiskScore(status?.data ?? null, status?.level ?? 'SAFE')), [status])
+  const riskScore = useMemo(() => {
+    if (status?.overallScore !== undefined) return Math.round(status.overallScore)
+    return Math.round(computeRiskScore(status?.data ?? null, status?.level ?? 'SAFE'))
+  }, [status])
+
+  const node1 = status?.nodes?.[0]
+  const node1Score = useMemo(() => {
+    if (node1?.score !== undefined) return Math.round(node1.score)
+    return Math.round(computeRiskScore(status?.data ?? null, status?.level ?? 'SAFE'))
+  }, [node1, status])
   const node2Score = 72 // placeholder for future node
 
   const sndText = status?.data?.snd ?? '--'
   const sndNum = parseFloat(status?.data?.snd ?? '0') || 0
-  const vibVal = status?.data?.vib ?? 0
-  const vibText = status?.data ? `${status.data.vib.toFixed(2)} g` : '--'
-  const gyrVal = status?.data?.gyr ?? 0
-  const gyrText = status?.data ? `${status.data.gyr.toFixed(1)}°` : '--'
-  const maxVib = vibHistory.length > 0 ? Math.max(...vibHistory) : vibVal
+  const tempRaw = status?.data?.temp
+  const tempVal = typeof tempRaw === 'number' ? tempRaw : parseFloat(tempRaw ?? '0') || 0
+  const tempText = status?.data && Number.isFinite(tempVal) ? `${tempVal.toFixed(1)}°C` : '--'
+  const gyrRaw = status?.data?.gyr
+  const gyrVal = typeof gyrRaw === 'number' ? gyrRaw : parseFloat(gyrRaw ?? '0') || 0
+  const gyrText = status?.data && Number.isFinite(gyrVal) ? `${gyrVal.toFixed(1)}°` : '--'
+  const maxTemp = tempHistory.length > 0 ? Math.max(...tempHistory) : tempVal
   const maxSnd = sndHistory.length > 0 ? Math.max(...sndHistory) : sndNum
   const level = status?.level ?? 'SAFE'
   const levelChip = levelLabel(level)
@@ -93,40 +111,43 @@ function App() {
           </div>
         </div>
 
-        {/* 좌측 스택: 진동, 음성, 자이로 */}
+        {/* 좌측 스택: 온도, 음성, 자이로 */}
         <div className="absolute left-[10px] top-[265px] flex h-[557px] w-[607px] flex-col gap-2.5">
-          {/* 진동 */}
+          {/* 온도 */}
           <div className="flex flex-1 flex-col gap-2 overflow-hidden rounded-[20px] bg-white p-6 shadow-sm">
             <div className="flex items-center justify-between gap-2.5">
-              <div className="text-base font-medium leading-6 text-stone-900">진동</div>
+              <div className="text-base font-medium leading-6 text-stone-900">온도</div>
               <div className="text-sm leading-5 text-stone-300">노드 1</div>
             </div>
-            {/* ECG 스타일 파형 */}
-            <div className="relative flex-1 overflow-hidden">
+            {/* 온도 추이 차트 - 실시간 데이터 반영 */}
+            <div className="relative flex-1 overflow-hidden rounded-lg bg-zinc-50">
               <svg className="h-full w-full" viewBox="0 0 560 70" preserveAspectRatio="none">
+                {/* 기준선 */}
+                <line x1="0" y1="35" x2="560" y2="35" stroke="#e5e5e5" strokeWidth="1" strokeDasharray="4 2" />
+                {/* 온도 라인 - tempHistory 배열 기반 */}
                 <polyline
                   fill="none"
                   stroke="#dc2626"
-                  strokeWidth="1.5"
-                  points={(() => {
-                    const data = vibHistory.length > 0 ? vibHistory : Array(30).fill(0.2)
-                    const width = 560
-                    const height = 70
-                    const mid = height / 2
-                    return data.map((v, i) => {
-                      const x = (i / (data.length - 1)) * width
-                      const spike = v > 1 ? (v / 3) * mid : v * 5
-                      const y = mid - spike + (Math.sin(i * 0.5) * 3)
-                      return `${x},${y}`
-                    }).join(' ')
-                  })()}
+                  strokeWidth="2"
+                  strokeLinejoin="round"
+                  points={
+                    tempHistory.length > 1
+                      ? tempHistory
+                          .map((v, i) => {
+                            const x = (i / (tempHistory.length - 1)) * 560
+                            // 온도 0~100 기준, 35px를 중간으로 스케일
+                            const normalized = Math.min(v, 100) / 100
+                            const y = 60 - normalized * 50 // 위로 갈수록 높은 온도
+                            return `${Math.round(x)},${Math.round(Math.max(5, Math.min(65, y)))}`
+                          })
+                          .join(' ')
+                      : '0,35 560,35' // 데이터 없으면 평탄한 선
+                  }
                 />
-                {/* 기준선 */}
-                <line x1="0" y1="35" x2="560" y2="35" stroke="#e5e5e5" strokeWidth="1" strokeDasharray="4 2" />
               </svg>
             </div>
             <div className="inline-flex items-center gap-2 text-sm leading-5 text-stone-600">
-              <div>최대 {maxVib.toFixed(2)} g · 임계 초과 {vibHistory.filter((v) => v > 1.5).length}회</div>
+              <div>최대 {maxTemp.toFixed(1)}°C</div>
               <div className="text-stone-300">(최근 30초 기준)</div>
             </div>
           </div>
@@ -142,16 +163,16 @@ function App() {
                 {sndText}
                 <span className="align-middle text-sm font-normal leading-5">dB</span>
               </div>
-              {/* 그라데이션 바 + 삼각형 마커 */}
-              <div className="relative">
-                {/* 삼각형 마커 */}
+              {/* 그라데이션 바 + 삼각형 마커 - sndNum (0~100 dB 범위) 기반 */}
+              <div className="relative pt-4">
+                {/* 삼각형 마커 - 실시간 sndNum 값에 따라 이동 */}
                 <div
-                  className="absolute -top-4 -translate-x-1/2 transition-all duration-300"
+                  className="absolute top-0 -translate-x-1/2 transition-all duration-300"
                   style={{ left: `${Math.min(100, Math.max(0, sndNum))}%` }}
                 >
                   <div className="w-0 h-0 border-l-[6px] border-r-[6px] border-t-[8px] border-l-transparent border-r-transparent border-t-stone-800" />
                 </div>
-                {/* 그라데이션 바 */}
+                {/* 그라데이션 바: 0-60 초록, 60-80 노랑, 80-100 빨강 */}
                 <div className="h-3 rounded-full overflow-hidden flex">
                   <div className="flex-[60] bg-lime-500" />
                   <div className="flex-[20] bg-yellow-400" />
@@ -173,16 +194,16 @@ function App() {
             </div>
             <div className="flex flex-1 flex-col justify-center gap-4">
               <div className="text-3xl font-semibold leading-[48px] text-black">{gyrText}</div>
-              {/* 3단계 슬라이더 바 + 삼각형 마커 */}
-              <div className="relative">
-                {/* 삼각형 마커 */}
+              {/* 3단계 슬라이더 바 + 삼각형 마커 - gyrVal (0~45° 범위) 기반 */}
+              <div className="relative pt-4">
+                {/* 삼각형 마커 - 실시간 gyrVal 값에 따라 이동 */}
                 <div
-                  className="absolute -top-4 -translate-x-1/2 transition-all duration-300"
+                  className="absolute top-0 -translate-x-1/2 transition-all duration-300"
                   style={{ left: `${Math.min(100, Math.max(0, (gyrVal / 45) * 100))}%` }}
                 >
                   <div className="w-0 h-0 border-l-[6px] border-r-[6px] border-t-[8px] border-l-transparent border-r-transparent border-t-stone-800" />
                 </div>
-                {/* 3단계 바 */}
+                {/* 3단계 바: 0-15° 정상, 15-30° 기울어짐, 30-45° 전도위험 */}
                 <div className="h-3 rounded-full overflow-hidden flex">
                   <div className="flex-1 bg-zinc-300" />
                   <div className="flex-1 bg-gradient-to-r from-yellow-400 to-orange-500" />

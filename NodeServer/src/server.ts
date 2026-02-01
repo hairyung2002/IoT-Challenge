@@ -9,7 +9,8 @@ import cors from "cors";
 
 // 1. 센서 데이터 구조 (진동, 기울기, 소리)
 interface SensorData {
-  vib: number; // 진동 (0~100)
+  nodeId?: string; // 노드 식별자 (없으면 node-1)
+  temp: number; // 온도 (섭씨)
   gyr: number; // 기울기 (0~180도)
   snd: string; // 소리 ("quiet", "crack", "crash" 등)
 }
@@ -24,12 +25,24 @@ interface CommandPayload {
   ts: number;
 }
 
-// 3. 현재 서버 상태 (리액트가 가져갈 데이터 구조)
-interface CurrentState {
+// 3. 노드별 위험도 구조
+interface NodeRisk {
+  id: string;
   level: RiskLevel;
+  score: number;
   message: string;
+  data: SensorData | null;
+  timestamp: string;
+}
+
+// 4. 현재 서버 상태 (리액트가 가져갈 데이터 구조)
+interface CurrentState {
+  level: RiskLevel; // 종합 위험도 레벨
+  message: string; // 종합 메시지
+  overallScore: number; // 종합 점수 0~100
   timestamp: string;
   data: SensorData | null;
+  nodes: NodeRisk[]; // 노드별 상세
 }
 
 // 4. Mobius 알림 구조 (oneM2M 표준)
@@ -61,12 +74,13 @@ const TARGET_CONTAINER_PATH = process.env.TARGET_CONTAINER_PATH || "/Mobius/cnt-
 const COMMAND_CONTAINER_PATH = process.env.COMMAND_CONTAINER_PATH || "/Mobius/cnt-cmd";
 const EXTERNAL_IP = process.env.EXTERNAL_IP || "noncausative-bryson-overluxuriously.ngrok-free.dev";
 const NOTIFICATION_URI = `https://${EXTERNAL_IP}/monitor`;
+const MOBIUS_ENABLED = process.env.MOBIUS_ENABLED === "true";
 
 // 위험도 임계값 설정 (필요시 환경변수로 조정)
 const RISK_THRESHOLD = {
-  dangerVib: Number(process.env.DANGER_VIB || 80),
+  dangerTemp: Number(process.env.DANGER_TEMP || 60), // 고열 시 즉시 위험
   dangerGyr: Number(process.env.DANGER_GYR || 50),
-  warningVib: Number(process.env.WARNING_VIB || 30),
+  warningTemp: Number(process.env.WARNING_TEMP || 45),
   warningGyr: Number(process.env.WARNING_GYR || 15),
 };
 
@@ -77,9 +91,14 @@ const RISK_THRESHOLD = {
 let currentStatus: CurrentState = {
   level: "SAFE",
   message: "현장이 안정적입니다.",
+  overallScore: 20,
   timestamp: new Date().toLocaleTimeString(),
   data: null,
+  nodes: [],
 };
+
+// 노드 상태 보관용 맵
+const nodeStore = new Map<string, NodeRisk>();
 
 // SSE 구독자 목록
 const sseClients = new Set<Response>();
@@ -120,17 +139,19 @@ function parseSensorData(contentRaw: unknown): SensorData | null {
   try {
     const obj = typeof contentRaw === "string" ? JSON.parse(contentRaw) : contentRaw;
     if (typeof obj !== "object" || obj === null) return null;
-    const vib = Number((obj as any).vib);
+    const nodeId = String((obj as any).nodeId || "node-1");
+    const temp = Number((obj as any).temp);
     const gyr = Number((obj as any).gyr);
     const snd = String((obj as any).snd || "");
-    if (Number.isNaN(vib) || Number.isNaN(gyr)) return null;
-    return { vib, gyr, snd };
+    if (Number.isNaN(temp) || Number.isNaN(gyr)) return null;
+    return { nodeId, temp, gyr, snd };
   } catch {
     return null;
   }
 }
 
 async function sendCommand(cmd: CommandPayload) {
+  if (!MOBIUS_ENABLED) return;
   const headers = {
     "X-M2M-RI": Date.now().toString(),
     "X-M2M-Origin": "S" + AE_NAME,
@@ -150,6 +171,7 @@ async function sendCommand(cmd: CommandPayload) {
 }
 
 async function maybeSendCommand(status: CurrentState) {
+  if (!MOBIUS_ENABLED) return;
   if (status.level === "DANGER") {
     await sendCommand({ level: "HIGH", siren: true, nodeId: "N1", ts: Date.now() });
   } else if (status.level === "WARNING") {
@@ -160,25 +182,76 @@ async function maybeSendCommand(status: CurrentState) {
 // ==========================================
 // [핵심 로직] 위험도 분석 함수
 // ==========================================
-function analyzeRisk(data: SensorData): { level: RiskLevel; msg: string } {
-  const { vib, gyr, snd } = data;
+function clamp(n: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, n));
+}
 
-  // 1. [DANGER] 즉시 대피 상황 (수치는 임의로 설정, 추후 조정 가능)
-  // - 진동이 80 이상이거나
-  // - 기울기가 50도 이상 꺾였거나
-  // - 붕괴음("crash")이 들릴 때
-  if (vib >= RISK_THRESHOLD.dangerVib || gyr >= RISK_THRESHOLD.dangerGyr || snd === "crash") {
-    return { level: "DANGER", msg: "🚨 긴급 대피! 2차 붕괴 징후 감지!" };
-  }
+// 노드별 위험 평가 (가중치 기반)
+// 기울기는 절대 각도(gyr)뿐 아니라 직전 대비 변화량(gyrDelta)을 반영
+function evaluateNode(sensorData: SensorData, prev?: NodeRisk): NodeRisk {
+  const sndScore = sensorData.snd === "crash" ? 95 : sensorData.snd === "crack" ? 65 : 10;
+  const tempScore = clamp(sensorData.temp, 0, 100);
 
-  // 2. [WARNING] 주의 요망
-  // - 진동 30 이상 or 기울기 15도 이상 or 균열음("crack")
-  if (vib >= RISK_THRESHOLD.warningVib || gyr >= RISK_THRESHOLD.warningGyr || snd === "crack") {
-    return { level: "WARNING", msg: "⚠️ 주의! 미세 진동 및 균열 감지." };
-  }
+  const prevGyr = prev?.data?.gyr ?? sensorData.gyr;
+  const gyrDelta = Math.abs(sensorData.gyr - prevGyr);
 
-  // 3. [SAFE] 안전
-  return { level: "SAFE", msg: "✅ 현장 안전함. 구조 작업 가능." };
+  const gyrScore = clamp(sensorData.gyr * 2, 0, 100); // 50도면 100점 환산
+  const deltaScore = clamp(gyrDelta * 4, 0, 100); // 변화량 25도 ≈ 100점
+
+  // 가중치: 온도 35%, 기울기 절대값 30%, 기울기 변화량 20%, 소리 15%
+  const weighted = tempScore * 0.35 + gyrScore * 0.3 + deltaScore * 0.2 + sndScore * 0.15;
+  const score = Math.round(weighted);
+
+  let level: RiskLevel = "SAFE";
+  if (score >= 75) level = "DANGER";
+  else if (score >= 45) level = "WARNING";
+
+  const msg =
+    level === "DANGER"
+      ? "🚨 붕괴 징후 감지! 즉시 대피"
+      : level === "WARNING"
+      ? "⚠️ 진동/기울기 이상, 주의 필요"
+      : "✅ 정상";
+
+  return {
+    id: sensorData.nodeId || "node-1",
+    level,
+    score,
+    message: msg,
+    data: sensorData,
+    timestamp: new Date().toLocaleTimeString(),
+  };
+}
+
+// 노드 상태 반영 후 종합 계산
+function updateStateWithNode(node: NodeRisk) {
+  nodeStore.set(node.id, node);
+  const nodeList = Array.from(nodeStore.values());
+
+  // 종합 레벨: DANGER > WARNING > SAFE (우선순위)
+  let overallLevel: RiskLevel = "SAFE";
+  if (nodeList.some((n) => n.level === "DANGER")) overallLevel = "DANGER";
+  else if (nodeList.some((n) => n.level === "WARNING")) overallLevel = "WARNING";
+
+  const overallScore = nodeList.length
+    ? Math.round(nodeList.reduce((sum, n) => sum + n.score, 0) / nodeList.length)
+    : 20;
+
+  const latestNode = node; // 가장 최근 업데이트 노드
+
+  currentStatus = {
+    level: overallLevel,
+    message:
+      overallLevel === "DANGER"
+        ? "🚨 다수 노드에서 붕괴 징후 감지"
+        : overallLevel === "WARNING"
+        ? "⚠️ 일부 노드 이상, 주의 필요"
+        : "✅ 현장 안정",
+    overallScore,
+    timestamp: new Date().toLocaleTimeString(),
+    data: latestNode?.data ?? null,
+    nodes: nodeList,
+  };
 }
 
 // ==========================================
@@ -199,21 +272,17 @@ app.post("/monitor", (req: Request, res: Response) => {
       return;
     }
 
-    // 위험도 분석 실행
-    const result = analyzeRisk(sensorData);
-
-    // 상태 업데이트 (전역 변수 갱신)
-    currentStatus = {
-      level: result.level,
-      message: result.msg,
-      timestamp: new Date().toLocaleTimeString(),
-      data: sensorData,
-    };
+    // 위험도 평가 및 상태 갱신 (직전 상태 기반 기울기 변화량 반영)
+    const prev = nodeStore.get(sensorData.nodeId || "node-1");
+    const node = evaluateNode(sensorData, prev);
+    updateStateWithNode(node);
 
     console.log(
-      `📊 수신값: Vib=${sensorData.vib}, Gyr=${sensorData.gyr}, Snd=${sensorData.snd}`
+      `📊 수신값: Temp=${sensorData.temp}, Gyr=${sensorData.gyr}, Snd=${sensorData.snd}`
     );
-    console.log(`🛡️ 분석결과: [${result.level}] ${result.msg}`);
+    console.log(
+      `🛡️ 분석결과: [${node.level}] ${node.message} (score ${node.score})`
+    );
 
     broadcastStatus();
     void maybeSendCommand(currentStatus);
@@ -264,18 +333,87 @@ app.post("/simulate", (req, res) => {
   const sensorData = parseSensorData(req.body);
   if (!sensorData) return res.status(400).json({ error: "invalid payload" });
 
-  const result = analyzeRisk(sensorData);
-  currentStatus = {
-    level: result.level,
-    message: result.msg,
-    timestamp: new Date().toLocaleTimeString(),
-    data: sensorData,
-  };
+  const prev = nodeStore.get(sensorData.nodeId || "node-1");
+  const node = evaluateNode(sensorData, prev);
+  updateStateWithNode(node);
 
   broadcastStatus();
   void maybeSendCommand(currentStatus);
 
   res.json(currentStatus);
+});
+
+// ==========================================
+// [API] 2-3. 랜덤 데이터 자동 생성 시뮬레이터
+// ==========================================
+let randomSimInterval: NodeJS.Timeout | null = null;
+
+function generateRandomSensorData(): SensorData {
+  // 랜덤 진동값 (0~5, 가끔 스파이크 10까지)
+  const vib = Math.random() < 0.1 
+    ? Math.random() * 100 // 10% 확률로 높은 값 (위험 상황)
+    : Math.random() * 30;  // 90% 확률로 낮은 값 (정상)
+  
+  // 랜덤 기울기 (0~60도)
+  const gyr = Math.random() < 0.15
+    ? Math.random() * 60  // 15% 확률로 높은 기울기
+    : Math.random() * 20;  // 85% 확률로 정상 범위
+  
+  // 랜덤 소리 (quiet, crack, crash)
+  const sndOptions = ["quiet", "quiet", "quiet", "quiet", "crack", "crash"];
+  const snd = sndOptions[Math.floor(Math.random() * sndOptions.length)];
+  
+  // 온도는 20~80 사이 분포 (10% 확률로 급상승)
+  const baseTemp = 20 + Math.random() * 20; // 20~40
+  const spike = Math.random() < 0.1 ? 30 + Math.random() * 20 : 0; // 최대 +50
+  const temp = baseTemp + spike;
+  
+  return { temp: Math.round(temp * 100) / 100, gyr: Math.round(gyr * 100) / 100, snd };
+}
+
+// 랜덤 시뮬레이션 시작
+app.post("/simulate/start", (req, res) => {
+  const interval = Number(req.query.interval) || 3000; // 기본 3초
+  
+  if (randomSimInterval) {
+    clearInterval(randomSimInterval);
+  }
+  
+  randomSimInterval = setInterval(() => {
+    // 두 노드에 대해 각각 랜덤 생성 (이전 상태를 반영해 기울기 변화량 계산)
+    ["node-1", "node-2"].forEach((id) => {
+      const sensorData = { ...generateRandomSensorData(), nodeId: id };
+      const prev = nodeStore.get(id);
+      const node = evaluateNode(sensorData, prev);
+      updateStateWithNode(node);
+    });
+
+    console.log(
+      `🎲 [RANDOM] n1=${currentStatus.nodes.find((n) => n.id === "node-1")?.score ?? '-'} / n2=${currentStatus.nodes.find((n) => n.id === "node-2")?.score ?? '-'} → overall ${currentStatus.level} (${currentStatus.overallScore}점)`
+    );
+    broadcastStatus();
+    void maybeSendCommand(currentStatus);
+  }, interval);
+  
+  console.log(`🎮 랜덤 시뮬레이션 시작 (${interval}ms 간격)`);
+  res.json({ status: "started", interval });
+});
+
+// 랜덤 시뮬레이션 중지
+app.post("/simulate/stop", (req, res) => {
+  if (randomSimInterval) {
+    clearInterval(randomSimInterval);
+    randomSimInterval = null;
+    console.log("🛑 랜덤 시뮬레이션 중지");
+    res.json({ status: "stopped" });
+  } else {
+    res.json({ status: "not running" });
+  }
+});
+
+// 현재 시뮬레이션 상태 조회
+app.get("/simulate/status", (req, res) => {
+  res.json({ running: randomSimInterval !== null });
 });
 
 // ==========================================

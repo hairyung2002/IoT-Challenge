@@ -1,16 +1,27 @@
 export type RiskLevel = "SAFE" | "WARNING" | "DANGER";
 
 export interface SensorData {
-  vib: number; // 진동
+  temp: number; // 온도
   gyr: number; // 기울기
   snd: string; // 소리 이벤트
 }
 
-export interface StatusPayload {
+export interface NodeRisk {
+  id: string;
   level: RiskLevel;
+  score: number;
   message: string;
+  data: SensorData | null;
+  timestamp: string;
+}
+
+export interface StatusPayload {
+  level: RiskLevel; // 종합 위험 레벨
+  message: string; // 종합 메시지
+  overallScore: number; // 종합 점수 0~100
   timestamp: string;
   data: SensorData | null;
+  nodes: NodeRisk[]; // 노드별 상세
 }
 
 const API_BASE = import.meta.env.VITE_SERVER_URL || "http://localhost:3000";
@@ -19,6 +30,15 @@ export async function fetchStatus(): Promise<StatusPayload> {
   const res = await fetch(`${API_BASE}/status`);
   if (!res.ok) throw new Error(`status ${res.status}`);
   return res.json();
+}
+
+// 랜덤 시뮬레이터 제어
+export async function startRandomSim(intervalMs = 5000): Promise<void> {
+  await fetch(`${API_BASE}/simulate/start?interval=${intervalMs}`, { method: "POST" });
+}
+
+export async function stopRandomSim(): Promise<void> {
+  await fetch(`${API_BASE}/simulate/stop`, { method: "POST" });
 }
 
 /**
@@ -58,9 +78,9 @@ export function computeRiskScore(data: SensorData | null, level: RiskLevel): num
   }
 
   const sndScore = data.snd === "crash" ? 95 : data.snd === "crack" ? 70 : 10;
-  const vibScore = Math.min(100, Math.max(0, data.vib));
+  const tempScore = Math.min(100, Math.max(0, data.temp));
   const gyrScore = Math.min(100, Math.max(0, data.gyr * 2));
-  const base = Math.max(sndScore, vibScore, gyrScore);
+  const base = Math.max(sndScore, tempScore, gyrScore);
 
   if (level === "DANGER") return Math.max(base, 82);
   if (level === "WARNING") return Math.max(base, 60);
